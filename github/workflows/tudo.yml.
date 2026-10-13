@@ -1,0 +1,83 @@
+name: Mapa MA
+on:
+  workflow_dispatch:
+    inputs:
+      acao:
+        description: "O que gerar?"
+        type: choice
+        options: [apk, dados, ambos]
+        default: ambos
+      valhalla_tag:
+        description: "Versao do Valhalla (3.6.x, igual a do app)"
+        default: "3.6.3"
+permissions:
+  contents: write
+jobs:
+  apk:
+    if: ${{ inputs.acao != 'dados' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Extrair projeto
+        run: unzip -q MapaMA.zip
+      - name: Fontes (nomes no mapa)
+        working-directory: MapaMA
+        run: |
+          git clone --depth 1 https://github.com/kylebarron/openmaptiles-fonts /tmp/fontes
+          mkdir -p app/src/main/assets/glyphs
+          cp -r "/tmp/fontes/fonts/Noto Sans Regular" "/tmp/fontes/fonts/Noto Sans Bold" app/src/main/assets/glyphs/
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Compilar
+        working-directory: MapaMA
+        run: gradle :app:assembleDebug --no-daemon
+      - name: Publicar APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete apk -y --cleanup-tag --repo ${{ github.repository }} || true
+          gh release create apk MapaMA/app/build/outputs/apk/debug/app-debug.apk --repo ${{ github.repository }} --title "APK Mapa MA" --notes "Baixe o app-debug.apk e instale."
+  dados:
+    if: ${{ inputs.acao != 'apk' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Extrair projeto
+        run: unzip -q MapaMA.zip
+      - name: Ferramentas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          pip install --break-system-packages osmium
+      - name: Baixar e cortar o Maranhao
+        run: |
+          wget -q https://download.geofabrik.de/south-america/brazil/nordeste-latest.osm.pbf
+          osmium extract -b -48.8,-10.3,-41.7,-1.0 nordeste-latest.osm.pbf -o maranhao.osm.pbf --overwrite
+          rm nordeste-latest.osm.pbf
+      - name: Mapa visual
+        run: |
+          wget -q https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
+          java -Xmx8g -jar planetiler.jar --osm-path=maranhao.osm.pbf --output=maranhao.mbtiles --download --force
+      - name: Rotas (Valhalla)
+        run: |
+          mkdir -p vh
+          cp maranhao.osm.pbf vh/
+          docker run --rm --entrypoint bash -v "$PWD/vh":/data ghcr.io/valhalla/valhalla:${{ inputs.valhalla_tag }} -c "cd /data && valhalla_build_config --mjolnir-tile-dir /data/tiles --mjolnir-tile-extract /data/valhalla_tiles.tar > valhalla.json && valhalla_build_tiles -c valhalla.json maranhao.osm.pbf && valhalla_build_extract -c valhalla.json -v"
+      - name: Busca
+        run: python3 MapaMA/tools/build_busca.py maranhao.osm.pbf busca.db
+      - name: Publicar dados
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dados -y --cleanup-tag --repo ${{ github.repository }} || true
+          gh release create dados maranhao.mbtiles vh/valhalla_tiles.tar busca.db --repo ${{ github.repository }} --title "Dados do Maranhao" --notes "Importe os 3 arquivos no app."
